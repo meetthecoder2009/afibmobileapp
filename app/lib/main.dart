@@ -1,19 +1,15 @@
 import 'dart:async';
-import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:path/path.dart' as p; // Import path package for basename
 import 'package:wakelock_plus/wakelock_plus.dart';
-import 'package:dio/dio.dart';
-import 'package:media_store_plus/media_store_plus.dart';
+import 'package:gallery_saver/gallery_saver.dart';
 
-List<CameraDescription> _availableCameras = [];
+List<CameraDescription> cameras = [];
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  _availableCameras = await availableCameras();
+  cameras = await availableCameras();
   runApp(const MyApp());
 }
 
@@ -22,11 +18,9 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Finger Camera Timer',
+    return const MaterialApp(
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark(),
-      home: const HomeScreen(),
+      home: HomeScreen(),
     );
   }
 }
@@ -39,211 +33,73 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  CameraController? _controller;
-  bool _recording = false;
-  int _secondsLeft = 20;
-  Timer? _countdownTimer;
-  bool _isFingerOn = false;
+  CameraController? controller;
+  bool recording = false;
+  int secondsLeft = 20;
+  Timer? timer;
 
   @override
   void dispose() {
-    _controller?.dispose();
-    _countdownTimer?.cancel();
+    controller?.dispose();
+    timer?.cancel();
     super.dispose();
   }
 
-  Future<bool> _requestPermission(Permission permission) async {
-    if (await permission.isGranted) {
-      return true;
-    } else {
-      var result = await permission.request();
-      if (result == PermissionStatus.granted) {
-        return true;
-      }
-    }
-    return false;
-  }
+  Future<void> startCamera() async {
+    await Permission.camera.request();
+    await Permission.microphone.request();
 
-  Future<void> downloadVideo(String videoUrl) async {
-    final downloadDirPath = await getDownloadDirectoryPath();
-    if (downloadDirPath == null) {
-      print("Could not get download directory path.");
-      return;
-    }
-
-    // Ensure the directory exists
-    final downloadDir = Directory(downloadDirPath);
-    if (!await downloadDir.exists()) {
-      await downloadDir.create(recursive: true);
-    }
-
-    final fileName = videoUrl.split('/').last; // Extract filename from URL
-    final filePath = '$downloadDirPath/$fileName';
-
-    try {
-      Dio dio = Dio();
-      await dio.download(
-        videoUrl,
-        filePath,
-        onReceiveProgress: (received, total) {
-          if (total != -1) {
-            print("${(received / total * 100).toStringAsFixed(0)}%");
-          }
-        },
-      );
-      print("Video downloaded successfully to: $filePath");
-    } catch (e) {
-      print("Error downloading video: $e");
-    }
-  }
-
-  Future<String?> getDownloadDirectoryPath() async {
-    if (Platform.isAndroid) {
-      // For Android, directly construct the common Downloads path
-      return "/storage/emulated/0/Download/";
-    }
-    return null; // Handle other platforms if needed
-  }
-
-  Future<void> _initCamera() async {
     WakelockPlus.enable();
 
-    final status = await Permission.camera.request();
-    if (!status.isGranted) {
-      debugPrint("❌ Camera permission not granted");
-      return;
-    }
-
-    final backCamera = _availableCameras.firstWhere(
+    final cam = cameras.firstWhere(
       (c) => c.lensDirection == CameraLensDirection.back,
-      orElse: () => _availableCameras.first,
+      orElse: () => cameras.first,
     );
 
-    _controller = CameraController(
-      backCamera,
+    controller = CameraController(
+      cam,
       ResolutionPreset.high,
       enableAudio: true,
     );
 
-    await _controller!.initialize();
-    await _controller!.setFlashMode(FlashMode.torch);
+    await controller!.initialize();
+    await controller!.setFlashMode(FlashMode.torch);
 
     setState(() {});
   }
 
-  void _processCameraImage(CameraImage image) {
-    try {
-      if (image.format.group != ImageFormatGroup.yuv420) return;
+  Future<void> startRecording() async {
+    if (recording) return;
 
-      final bytes = image.planes[0].bytes; // luminance
-      final avg = bytes.fold<int>(0, (p, e) => p + e) ~/ bytes.length;
+    await controller!.startVideoRecording();
+    recording = true;
+    secondsLeft = 20;
 
-      final isRed = avg < 80;
-
-      if (isRed && !_isFingerOn) {
-        _isFingerOn = true;
-        _startRecording();
-      } else if (!isRed && _isFingerOn) {
-        _isFingerOn = false;
-      }
-    } catch (e) {
-      debugPrint("❌ Error processing frame: $e");
-    }
-  }
-
-  Future<void> _startRecording() async {
-    if (_recording) return;
-
-    await _controller!.startVideoRecording();
-
-    setState(() {
-      _recording = true;
-      _secondsLeft = 20;
-    });
-
-    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (t) async {
-      if (!mounted) return;
-      if (_secondsLeft > 0) {
-        setState(() => _secondsLeft--);
-      } else {
+    timer = Timer.periodic(const Duration(seconds: 1), (t) async {
+      if (secondsLeft == 0) {
         t.cancel();
-        await _stopRecording();
+        await stopRecording();
+      } else {
+        setState(() => secondsLeft--);
       }
     });
   }
 
-  Future<void> _stopRecording() async {
-    if (!_recording) return;
-    final XFile videoFile = await _controller!.stopVideoRecording();
-    _countdownTimer?.cancel();
+  Future<void> stopRecording() async {
+    if (!recording) return;
 
-    setState(() => _recording = false);
+    final file = await controller!.stopVideoRecording();
+    recording = false;
 
-    // ✅ Save to Downloads
-    final ms = MediaStore();
-    final saved = await ms.saveFile(
-      tempFilePath: videoFile.path,
-      dirType: DirType.download,
-      dirName: DirName.download,
-      relativePath: FilePath.root,
-    );
+    await GallerySaver.saveVideo(file.path);
 
-    final ok = saved?.isSuccessful ?? false;
-    final name = saved?.name ?? 'video.mp4';
+    if (!mounted) return;
 
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          ok
-              ? 'Saved to Downloads/$name'
-              : 'Saved duplicate as Downloads/$name',
-        ),
-      ),
+      const SnackBar(content: Text('Saved to Photos')),
     );
-  } // <-- THIS closing brace was missing before!
 
-  Widget _buildCameraView() {
-    if (_controller == null || !_controller!.value.isInitialized) {
-      return const Center(child: Text("Press Start to open camera"));
-    }
-
-    final double previewSize = MediaQuery.of(context).size.shortestSide * 0.8;
-    final double ringSize = previewSize + 30;
-
-    return Center(
-      child: Stack(
-        alignment: Alignment.center,
-        children: [
-          if (_recording)
-            SizedBox(
-              width: ringSize,
-              height: ringSize,
-              child: CircularProgressIndicator(
-                value: (20 - _secondsLeft) / 20,
-                strokeWidth: 10,
-                backgroundColor: Colors.white12,
-                valueColor: const AlwaysStoppedAnimation<Color>(Colors.red),
-              ),
-            ),
-          ClipOval(
-            child: SizedBox(
-              width: previewSize,
-              height: previewSize,
-              child: CameraPreview(_controller!),
-            ),
-          ),
-          if (_recording)
-            Text(
-              '$_secondsLeft s',
-              style: const TextStyle(
-                fontSize: 20,
-                fontWeight: FontWeight.bold,
-                color: Colors.white,
-              ),
-            ),
-        ],
-      ),
-    );
+    setState(() {});
   }
 
   @override
@@ -253,16 +109,22 @@ class _HomeScreenState extends State<HomeScreen> {
       body: SafeArea(
         child: Column(
           children: [
-            Expanded(child: _buildCameraView()),
+            Expanded(
+              child: controller == null
+                  ? const Center(child: Text("Press Start"))
+                  : CameraPreview(controller!),
+            ),
             Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  onPressed: _initCamera,
-                  icon: const Icon(Icons.play_arrow),
-                  label: const Text("Start Camera"),
-                ),
+              padding: const EdgeInsets.all(16),
+              child: ElevatedButton(
+                onPressed: () async {
+                  if (controller == null) {
+                    await startCamera();
+                  } else if (!recording) {
+                    await startRecording();
+                  }
+                },
+                child: Text(recording ? '$secondsLeft s' : 'Start'),
               ),
             ),
           ],
