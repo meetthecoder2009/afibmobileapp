@@ -36,7 +36,8 @@ class HeartRateMonitor extends StatefulWidget {
   State<HeartRateMonitor> createState() => _HeartRateMonitorState();
 }
 
-class _HeartRateMonitorState extends State<HeartRateMonitor> {
+class _HeartRateMonitorState extends State<HeartRateMonitor>
+    with WidgetsBindingObserver {
   CameraController? _controller;
   bool _isProcessing = false;
   // Data buffer storing value and timestamp
@@ -67,10 +68,25 @@ class _HeartRateMonitorState extends State<HeartRateMonitor> {
     super.initState();
     _initializeCamera();
     WakelockPlus.enable();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_controller == null || !_controller!.value.isInitialized) {
+      return;
+    }
+
+    if (state == AppLifecycleState.inactive) {
+      _controller?.dispose();
+    } else if (state == AppLifecycleState.resumed) {
+      _initializeCamera();
+    }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _controller?.dispose();
     WakelockPlus.disable();
     super.dispose();
@@ -390,6 +406,22 @@ class _HeartRateMonitorState extends State<HeartRateMonitor> {
         centerTitle: true,
         backgroundColor: Colors.transparent,
         elevation: 0,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.flash_on),
+            onPressed: () {
+              if (_controller != null) {
+                _controller!.setFlashMode(FlashMode.torch);
+              } else {
+                _initializeCamera();
+              }
+            },
+          ),
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: _initializeCamera,
+          ),
+        ],
       ),
       body: SafeArea(
         child: Column(
