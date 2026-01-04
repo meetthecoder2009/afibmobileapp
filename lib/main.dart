@@ -3,7 +3,10 @@ import 'dart:math' as math;
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
+
+import 'fitness_survey.dart';
 
 void main() {
   runApp(const MyApp());
@@ -24,7 +27,7 @@ class MyApp extends StatelessWidget {
           brightness: Brightness.dark,
         ),
       ),
-      home: const HeartRateMonitor(),
+      home: const FitnessSurveyScreen(),
     );
   }
 }
@@ -46,7 +49,6 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
   double _bpm = 0.0;
 
   // Algorithm parameters
-  // Algorithm parameters
   int _windowSize = 150; // Dynamic window size based on FPS
   static const int _smoothingWindow = 5;
   static const double _targetMonitoringSeconds = 6.0;
@@ -55,8 +57,14 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
   DateTime? _lastFrameTime;
   double _currentFps = 30.0;
 
-  // AFib Detection
+  // Analysis Result
   bool _isAfibPossible = false;
+  String _healthStatus = "Analyzing...";
+  Color _statusColor = Colors.grey;
+
+  // User Profile
+  bool _isFit = false;
+
   static const int _minFingerBrightness = 30;
   static const int _maxFingerBrightness = 250;
 
@@ -66,9 +74,17 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
   @override
   void initState() {
     super.initState();
+    _loadUserProfile();
     _initializeCamera();
     WakelockPlus.enable();
     WidgetsBinding.instance.addObserver(this);
+  }
+
+  Future<void> _loadUserProfile() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _isFit = prefs.getBool('is_fit') ?? false;
+    });
   }
 
   @override
@@ -171,6 +187,8 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
       _data.clear();
       _bpmValues.clear();
       _bpm = 0.0;
+      _healthStatus = "Place finger on camera";
+      _statusColor = Colors.grey;
       if (mounted) setState(() {});
       _isProcessing = false;
       return;
@@ -353,6 +371,9 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
           intervals.reduce((a, b) => a + b) / intervals.length;
       double instantBpm = 60000 / avgIntervalMs;
 
+      // Calculate avg interval in Seconds for RR analysis
+      double avgIntervalSec = avgIntervalMs / 1000.0;
+
       // 5. Outlier Rejection & Smoothing
       if (instantBpm > 40 && instantBpm < 180) {
         _bpmValues.add(instantBpm.round());
@@ -360,8 +381,6 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
 
         // Sort to find median to ignore random spikes
         List<int> sorted = List.from(_bpmValues)..sort();
-        // Use median or trimmed average
-        // Trimmed average: ignore top/bottom 1 if enough samples
 
         double finalBpm;
         if (sorted.length >= 5) {
@@ -377,21 +396,47 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
 
         _bpm = finalBpm;
 
-        // 5. AFib Detection (RMSSD)
-        // Root Mean Square of Successive Differences between RR intervals
-        double sumSquaredDiffs = 0;
-        for (int i = 0; i < intervals.length - 1; i++) {
-          double diff = intervals[i + 1] - intervals[i];
-          sumSquaredDiffs += diff * diff;
-        }
-        if (intervals.length > 1) {
-          double rmssd = math.sqrt(sumSquaredDiffs / (intervals.length - 1));
-          // AFib Threshold Logic
-          // Heuristic: RMSSD > 100ms indicates high variability
-          if (rmssd > 100) {
-            _isAfibPossible = true;
-          } else {
+        // 6. AFib & Bradycardia/Tachycardia Detection Logic
+        // "RR interval of 0.6-1.2 seconds is considered normal"
+        // < 0.6s -> Tachycardia
+        // > 1.2s -> Bradycardia
+
+        bool isBradycardia = finalBpm < 60 && avgIntervalSec > 1.2;
+        bool isTachycardia = finalBpm > 100 && avgIntervalSec < 0.6;
+
+        if (isBradycardia) {
+          if (_isFit) {
+            _healthStatus = "Low Resting HR (Normal for Athletes)";
+            _statusColor = Colors.green;
             _isAfibPossible = false;
+          } else {
+            _healthStatus = "Bradycardia Detected\n(Slow Heart Rate)";
+            _statusColor = Colors.orange;
+            _isAfibPossible = true; // Flagging as abnormal
+          }
+        } else if (isTachycardia) {
+          _healthStatus = "Tachycardia Detected\n(Fast Heart Rate)";
+          _statusColor = Colors.red;
+          _isAfibPossible = true;
+        } else {
+          // Normal Range Logic
+          // AFib Detection (RMSSD)
+          double sumSquaredDiffs = 0;
+          for (int i = 0; i < intervals.length - 1; i++) {
+            double diff = intervals[i + 1] - intervals[i];
+            sumSquaredDiffs += diff * diff;
+          }
+          if (intervals.length > 1) {
+            double rmssd = math.sqrt(sumSquaredDiffs / (intervals.length - 1));
+            if (rmssd > 100) {
+              _isAfibPossible = true;
+              _healthStatus = "Irregular Rhythm Detected";
+              _statusColor = Colors.orange;
+            } else {
+              _isAfibPossible = false;
+              _healthStatus = "Normal Sinus Rhythm";
+              _statusColor = Colors.green;
+            }
           }
         }
       }
@@ -427,7 +472,7 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
         child: Column(
           children: [
             const SizedBox(height: 20),
-            // Camera Preview (Small circular window)
+            // Camera Preview
             Container(
               width: 120,
               height: 120,
@@ -455,7 +500,7 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
               padding: const EdgeInsets.all(16.0),
               child: Text(
                 _isFingerPresent
-                    ? "Detecting Pulse..."
+                    ? "Measuring..."
                     : "Place your finger gently covering the camera and flash",
                 textAlign: TextAlign.center,
                 style: TextStyle(
@@ -486,15 +531,18 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
             if (_isFingerPresent && _bpm > 0)
               Padding(
                 padding: const EdgeInsets.only(top: 10),
-                child: Text(
-                  _isAfibPossible
-                      ? "Possible Irregularity Detected"
-                      : "Regular Rhythm",
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                    color: _isAfibPossible ? Colors.orange : Colors.green,
-                  ),
+                child: Column(
+                  children: [
+                    Text(
+                      _healthStatus,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        color: _statusColor,
+                      ),
+                    ),
+                  ],
                 ),
               ),
             const Spacer(),
@@ -530,11 +578,6 @@ class ChartPainter extends CustomPainter {
       ..style = PaintingStyle.stroke;
 
     final path = Path();
-
-    // Extract values for plotting
-    // To handle timestamp based plotting is complex for a simple sparkline,
-    // for now we just plot indices as the window is sliding.
-    // Ideally we plot X based on time, but uniform spacing is enough for visualization here.
 
     List<double> values = data.map((e) => e.value).toList();
 
