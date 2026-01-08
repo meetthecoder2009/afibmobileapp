@@ -6,7 +6,8 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
-import 'fitness_survey.dart';
+import 'result_screen.dart';
+import 'symptom_survey.dart';
 
 void main() {
   runApp(const MyApp());
@@ -27,7 +28,7 @@ class MyApp extends StatelessWidget {
           brightness: Brightness.dark,
         ),
       ),
-      home: const FitnessSurveyScreen(),
+      home: const SymptomSurveyScreen(),
     );
   }
 }
@@ -64,6 +65,18 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
 
   // User Profile
   bool _isFit = false;
+  bool _hasSymptoms = false;
+
+  // Measurement State
+  bool _isMeasuring = false;
+  DateTime? _measurementStartTime;
+  double _progress = 0.0;
+  final int _measurementDurationSeconds = 30;
+
+  // Accumulated Data for Final Report
+  final List<int> _sessionBpmValues = [];
+  final List<double> _sessionIntervals = []; // ms
+  final List<SensorValue> _sessionRawData = [];
 
   static const int _minFingerBrightness = 30;
   static const int _maxFingerBrightness = 250;
@@ -84,6 +97,7 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
     final prefs = await SharedPreferences.getInstance();
     setState(() {
       _isFit = prefs.getBool('is_fit') ?? false;
+      _hasSymptoms = prefs.getBool('has_symptoms') ?? false;
     });
   }
 
@@ -184,17 +198,30 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
 
     if (!validFinger) {
       _isFingerPresent = false;
+      _statusMessage = "Place your finger on the camera";
+      _statusColor = Colors.grey;
+
+      // If measurement was active, cancel it or pause?
+      // User request implies strict quality, so let's cancel/reset if finger lifted for too long.
+      if (_isMeasuring) {
+        _stopMeasurement(cancelled: true);
+      }
+
       _data.clear();
       _bpmValues.clear();
       _bpm = 0.0;
-      _healthStatus = "Place finger on camera";
-      _statusColor = Colors.grey;
       if (mounted) setState(() {});
       _isProcessing = false;
       return;
     }
 
     _isFingerPresent = true;
+    _statusMessage = "Detecting Heartbeat...";
+
+    // Auto-start measurement if finger is present and not measuring
+    if (!_isMeasuring) {
+      _startMeasurement();
+    }
 
     // Add new data point with timestamp
     final now = DateTime.now();
@@ -209,6 +236,122 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
 
     _isProcessing = false;
     if (mounted) setState(() {});
+  }
+
+  String _statusMessage = "Place finger on camera";
+
+  void _startMeasurement() {
+    setState(() {
+      _isMeasuring = true;
+      _measurementStartTime = DateTime.now();
+      _progress = 0.0;
+      _sessionBpmValues.clear();
+      _sessionIntervals.clear();
+      _sessionRawData.clear();
+      _statusMessage = "Measuring... Hold still";
+    });
+  }
+
+  void _stopMeasurement({bool cancelled = false}) {
+    if (cancelled) {
+      setState(() {
+        _isMeasuring = false;
+        _progress = 0.0;
+        _statusMessage = "Measurement interrupted. Please hold still for 30s.";
+      });
+      return;
+    }
+
+    setState(() {
+      _isMeasuring = false;
+      _progress = 1.0;
+    });
+
+    _calculateAndShowResults();
+  }
+
+  void _calculateAndShowResults() {
+    if (_sessionBpmValues.isEmpty) {
+      _stopMeasurement(cancelled: true);
+      return;
+    }
+
+    // 1. Calculate HR Metrics
+    int avgBpm =
+        (_sessionBpmValues.reduce((a, b) => a + b) / _sessionBpmValues.length)
+            .round();
+    int minBpm = _sessionBpmValues.reduce(math.min);
+    int maxBpm = _sessionBpmValues.reduce(math.max);
+
+    // 2. Calculate Regularity Metrics (RMSSD, SDNN)
+    double rmssd = 0;
+    double sdnn = 0;
+
+    if (_sessionIntervals.length > 1) {
+      // RMSSD
+      double sumSquaredDiffs = 0;
+      for (int i = 0; i < _sessionIntervals.length - 1; i++) {
+        double diff = _sessionIntervals[i + 1] - _sessionIntervals[i];
+        sumSquaredDiffs += diff * diff;
+      }
+      rmssd = math.sqrt(sumSquaredDiffs / (_sessionIntervals.length - 1));
+
+      // SDNN
+      double meanInterval =
+          _sessionIntervals.reduce((a, b) => a + b) / _sessionIntervals.length;
+      double sumSquaredDeviations = 0;
+      for (var interval in _sessionIntervals) {
+        sumSquaredDeviations += math.pow(interval - meanInterval, 2);
+      }
+      sdnn = math.sqrt(sumSquaredDeviations / (_sessionIntervals.length - 1));
+    }
+
+    // 3. Assess Quality
+    String quality = 'High';
+    if (_sessionIntervals.length < 15) {
+      quality = 'Low';
+    } else if (rmssd > 200) {
+      quality = 'Medium';
+    }
+
+    // 4. Interpretation Logic
+    String rhythmStatus = "Regular Rhythm Detected";
+    if (quality == 'Low') {
+      rhythmStatus = "Measurement Unreliable";
+    } else {
+      if (rmssd > 100 || sdnn > 100) {
+        rhythmStatus = _hasSymptoms
+            ? "Possible Irregular Rhythm (Symptomatic)"
+            : "Possible Irregular Rhythm";
+      } else if (rmssd > 50) {
+        rhythmStatus = "Elevated Variability Detected";
+      }
+    }
+
+    // Override logic for Brady/Tachy in Result Screen text
+    if (avgBpm < 60 && !_isFit) {
+      rhythmStatus = _hasSymptoms
+          ? "Bradycardia Detected"
+          : "Low Heart Rate (Asymptomatic)";
+    } else if (avgBpm > 100) {
+      rhythmStatus = _hasSymptoms
+          ? "Tachycardia Detected"
+          : "High Heart Rate (Asymptomatic)";
+    }
+
+    // Navigate to Result Screen
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (context) => ResultScreen(
+        averageBpm: avgBpm,
+        minBpm: minBpm,
+        maxBpm: maxBpm,
+        rmssd: rmssd,
+        sdnn: sdnn,
+        durationSeconds: _measurementDurationSeconds,
+        quality: quality,
+        rhythmStatus: rhythmStatus,
+      ),
+    ));
   }
 
   bool _detectFinger(CameraImage image) {
@@ -377,24 +520,41 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
       // 5. Outlier Rejection & Smoothing
       if (instantBpm > 40 && instantBpm < 180) {
         _bpmValues.add(instantBpm.round());
-        if (_bpmValues.length > 10) _bpmValues.removeAt(0);
+        // Increase buffer to ~2 seconds worth of frames (assume 30fps -> 60 frames)
+        // Previous 10 was too short (~0.3s), causing rapid fluctuations.
+        if (_bpmValues.length > 50) _bpmValues.removeAt(0);
 
         // Sort to find median to ignore random spikes
         List<int> sorted = List.from(_bpmValues)..sort();
 
-        double finalBpm;
+        double currentCalculatedBpm;
         if (sorted.length >= 5) {
-          // Remove min and max
+          // Remove min and max outliers (bottom 10% and top 10%)
+          int removeCount = (sorted.length * 0.1).ceil();
           int sum = 0;
-          for (int i = 1; i < sorted.length - 1; i++) {
+          int count = 0;
+          for (int i = removeCount; i < sorted.length - removeCount; i++) {
             sum += sorted[i];
+            count++;
           }
-          finalBpm = sum / (sorted.length - 2);
+          currentCalculatedBpm = (count == 0)
+              ? sorted[sorted.length ~/ 2].toDouble()
+              : sum / count;
         } else {
-          finalBpm = sorted.reduce((a, b) => a + b) / sorted.length;
+          currentCalculatedBpm = sorted.reduce((a, b) => a + b) / sorted.length;
         }
 
-        _bpm = finalBpm;
+        // Apply Exponential Moving Average (EMA) for display stability
+        // _bpm = alpha * new + (1-alpha) * old
+        // Lower alpha = smoother but more lag. 0.1 is usually good for display.
+        if (_bpm == 0.0) {
+          _bpm = currentCalculatedBpm;
+        } else {
+          _bpm = _bpm * 0.9 + currentCalculatedBpm * 0.1;
+        }
+
+        // Use the smoothed _bpm for 'finalBpm' in logic below
+        double finalBpm = _bpm;
 
         // 6. AFib & Bradycardia/Tachycardia Detection Logic
         // "RR interval of 0.6-1.2 seconds is considered normal"
@@ -404,20 +564,62 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
         bool isBradycardia = finalBpm < 60 && avgIntervalSec > 1.2;
         bool isTachycardia = finalBpm > 100 && avgIntervalSec < 0.6;
 
+        // Update Session Data if Measuring
+        if (_isMeasuring) {
+          // Accumulate BPM
+          _sessionBpmValues.add(finalBpm.round());
+
+          // Accumulate Intervals (last one calculated)
+          if (intervals.isNotEmpty) {
+            _sessionIntervals.add(intervals.last);
+          }
+
+          // Update Progress
+          final elapsed = DateTime.now().difference(_measurementStartTime!);
+          if (mounted) {
+            // Ensure mounted before setState
+            setState(() {
+              _progress =
+                  elapsed.inMilliseconds / (_measurementDurationSeconds * 1000);
+              if (_progress >= 1.0) {
+                _progress = 1.0;
+              }
+            });
+
+            if (_progress >= 1.0) {
+              _stopMeasurement();
+            }
+          }
+        }
+
+        // Logic Refinement for Symptoms
         if (isBradycardia) {
           if (_isFit) {
             _healthStatus = "Low Resting HR (Normal for Athletes)";
             _statusColor = Colors.green;
             _isAfibPossible = false;
           } else {
-            _healthStatus = "Bradycardia Detected\n(Slow Heart Rate)";
-            _statusColor = Colors.orange;
-            _isAfibPossible = true; // Flagging as abnormal
+            if (_hasSymptoms) {
+              _healthStatus = "Bradycardia Detected (Symptomatic)";
+              _statusColor = Colors.redAccent; // Serious
+              _isAfibPossible = true;
+            } else {
+              _healthStatus = "Low Heart Rate (Asymptomatic)";
+              _statusColor = Colors.orangeAccent; // Warning/Yellow-ish
+              _isAfibPossible =
+                  false; // Not flagging as full "Bradycardia" condition without symptoms per request
+            }
           }
         } else if (isTachycardia) {
-          _healthStatus = "Tachycardia Detected\n(Fast Heart Rate)";
-          _statusColor = Colors.red;
-          _isAfibPossible = true;
+          if (_hasSymptoms) {
+            _healthStatus = "Tachycardia Detected (Symptomatic)";
+            _statusColor = Colors.redAccent;
+            _isAfibPossible = true;
+          } else {
+            _healthStatus = "High Heart Rate (Asymptomatic)";
+            _statusColor = Colors.orangeAccent; // Warning/Yellow-ish
+            _isAfibPossible = false;
+          }
         } else {
           // Normal Range Logic
           // AFib Detection (RMSSD)
@@ -428,14 +630,23 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
           }
           if (intervals.length > 1) {
             double rmssd = math.sqrt(sumSquaredDiffs / (intervals.length - 1));
+
             if (rmssd > 100) {
-              _isAfibPossible = true;
-              _healthStatus = "Irregular Rhythm Detected";
-              _statusColor = Colors.orange;
+              // High irregularity
+              if (_hasSymptoms) {
+                _healthStatus = "Irregular Rhythm Detected (Symptomatic)";
+                _statusColor =
+                    Colors.orangeAccent; // User requested Yellow for Irregular
+                _isAfibPossible = true;
+              } else {
+                _healthStatus = "Possible Irregularity (Consult Doctor)";
+                _statusColor = Colors.orangeAccent; // User requested Yellow
+                _isAfibPossible = true;
+              }
             } else {
               _isAfibPossible = false;
               _healthStatus = "Normal Sinus Rhythm";
-              _statusColor = Colors.green;
+              _statusColor = Colors.greenAccent;
             }
           }
         }
@@ -499,9 +710,7 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
             Padding(
               padding: const EdgeInsets.all(16.0),
               child: Text(
-                _isFingerPresent
-                    ? "Measuring..."
-                    : "Place your finger gently covering the camera and flash",
+                _statusMessage,
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   color: _isFingerPresent ? Colors.white : Colors.white70,
@@ -510,6 +719,18 @@ class _HeartRateMonitorState extends State<HeartRateMonitor>
                 ),
               ),
             ),
+            if (_isMeasuring)
+              Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 40, vertical: 10),
+                child: LinearProgressIndicator(
+                  value: _progress,
+                  backgroundColor: Colors.grey[800],
+                  color: Colors.redAccent,
+                  minHeight: 6,
+                  borderRadius: BorderRadius.circular(3),
+                ),
+              ),
             const Spacer(),
             // BPM Display
             Text(
